@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#1976d2" />
+  <title>Corretor OMR</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════════
+     TELA 1 — Home
+══════════════════════════════════════════════════════════════ -->
+<section id="screen-home" class="screen active">
+  <div class="app-bar">
+    <h1>📋 Corretor OMR</h1>
+    <button id="btn-new-exam" class="btn-new-exam-bar" title="Nova prova">＋ Nova Prova</button>
+  </div>
+
+  <div class="home-content">
+    <!-- Banner de carregamento do OpenCV -->
+    <div id="cv-loading">
+      <div class="spinner"></div>
+      <span>Carregando motor de visão computacional…</span>
+    </div>
+
+    <!-- Lista de provas -->
+    <div id="exam-list"></div>
+
+    <!-- Estado vazio -->
+    <div id="no-exam-msg" class="empty-state" style="display:none">
+      <div class="empty-icon">📄</div>
+      <p>Nenhum gabarito cadastrado.</p>
+      <button id="btn-new-exam-empty" class="btn-primary" style="margin-top:12px">
+        ＋ Criar primeira prova
+      </button>
+    </div>
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════
+     TELA 2 — Captura OMR
+══════════════════════════════════════════════════════════════ -->
+<section id="screen-capture" class="screen">
+  <div class="capture-header" id="capture-exam-title">Correção</div>
+
+  <div class="camera-wrap" style="flex:1">
+    <video id="capture-video" autoplay playsinline muted></video>
+    <canvas id="capture-overlay"></canvas>
+  </div>
+
+  <div id="capture-hint" class="capture-hint status-info">
+    Enquadre o cartão-resposta
+  </div>
+
+  <div class="capture-bottom">
+    <div class="student-row">
+      <input id="student-name" type="text" placeholder="Nome do aluno (opcional)" autocomplete="off" />
+    </div>
+    <div class="capture-btns">
+      <button id="btn-manual-capture" class="btn-primary">
+        📸 Capturar
+      </button>
+      <button id="btn-back-home-cap" class="btn-ghost">
+        ✕ Sair
+      </button>
+    </div>
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════
+     TELA 3 — Resultado
+══════════════════════════════════════════════════════════════ -->
+<section id="screen-result" class="screen">
+  <div class="app-bar">
+    <button id="btn-back-home-result" class="btn-back">←</button>
+    <h1>Resultado</h1>
+  </div>
+
+  <div class="result-content">
+    <div class="result-score-card">
+      <div class="result-score-num" id="result-score">— / —</div>
+      <div class="result-score-pct"  id="result-pct">—%</div>
+      <div class="result-score-meta">
+        <span id="result-exam-id">—</span> ·
+        <span id="result-student">—</span> ·
+        <span id="result-date">—</span>
+      </div>
+    </div>
+
+    <p class="section-label">Cartão corrigido</p>
+    <div class="result-image-wrap">
+      <div id="result-image"></div>
+    </div>
+
+    <p class="section-label">Detalhamento por questão</p>
+    <div class="result-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Q</th>
+            <th>Marcada</th>
+            <th>Correta</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="result-table-body"></tbody>
+      </table>
+    </div>
+
+    <div class="result-actions">
+      <button id="btn-retry" class="btn-secondary">📷 Nova foto</button>
+      <button id="btn-export-csv" class="btn-ghost">⬇ CSV</button>
+      <button id="btn-export-json" class="btn-ghost">⬇ JSON</button>
+    </div>
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════
+     TELA 4 — Editor de Gabarito
+══════════════════════════════════════════════════════════════ -->
+<section id="screen-editor" class="screen">
+  <div class="app-bar">
+    <button id="btn-back-home-ed" class="btn-back">←</button>
+    <h1 id="editor-title">Nova Prova</h1>
+  </div>
+
+  <div class="gen-content">
+
+    <!-- Tipo de cartão -->
+    <input type="hidden" id="gen-layout" value="full" />
+    <div class="form-group">
+      <label>Tipo de cartão</label>
+      <div class="layout-selector" id="layout-selector">
+        <label class="layout-option">
+          <input type="radio" name="gen-layout-radio" value="full" checked />
+          <span class="layout-option-box">
+            <span class="layout-icon">📄</span>
+            <strong>Página inteira</strong>
+            <small>Cartão A4 dedicado — cabeçalho completo, até 100 questões</small>
+          </span>
+        </label>
+        <label class="layout-option">
+          <input type="radio" name="gen-layout-radio" value="compact" />
+          <span class="layout-option-box">
+            <span class="layout-icon">🗒</span>
+            <strong>Compacto</strong>
+            <small>Bloco inserido na prova — ocupa ~1/3 de uma página, até 30 questões</small>
+          </span>
+        </label>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Título da prova</label>
+      <input id="gen-title" type="text" placeholder="Ex: Avaliação — 1º Bimestre" />
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label>ID</label>
+        <input id="gen-id" type="text" placeholder="PROVA-01" />
+      </div>
+      <div class="form-group">
+        <label>Questões <span id="gen-n-hint" style="font-weight:400;color:#aaa;font-size:.8em">(máx. 96)</span></label>
+        <input id="gen-n" type="number" min="1" max="96" value="20" />
+      </div>
+      <div class="form-group">
+        <label>Alternativas</label>
+        <select id="gen-opt">
+          <option value="2">2 (A–B)</option>
+          <option value="3">3 (A–C)</option>
+          <option value="4">4 (A–D)</option>
+          <option value="5" selected>5 (A–E)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="key-row">
+      <div class="form-group">
+        <label>Gabarito (uma letra por questão)</label>
+        <input id="gen-key" type="text" placeholder="Ex: ABCDEABCDE…" autocomplete="off"
+               style="font-family:monospace;letter-spacing:.1em" />
+      </div>
+      <button id="btn-gen-random" class="btn-ghost btn-sm" style="white-space:nowrap">
+        🎲 Aleatório
+      </button>
+    </div>
+
+    <button id="btn-gen-save" class="btn-primary btn-block">
+      💾 Salvar Prova
+    </button>
+
+    <button id="btn-gen-preview" class="btn-secondary btn-block" style="margin-top:8px">
+      👁 Pré-visualizar cartão para impressão
+    </button>
+
+    <!-- Preview do cartão -->
+    <div class="gen-preview-wrap" style="display:none" id="gen-preview-wrap">
+      <canvas id="gen-canvas"></canvas>
+    </div>
+
+    <div id="gen-actions" style="display:none; gap:10px; flex-wrap:wrap; margin-top:8px">
+      <button id="btn-gen-print" class="btn-ghost" style="flex:1;min-width:120px">
+        🖨 Imprimir / PDF
+      </button>
+    </div>
+  </div>
+</section>
+
+
+<!-- ══════════════════════════════════════════════════════════════
+     Scripts
+══════════════════════════════════════════════════════════════ -->
+
+<!-- OpenCV.js — visão computacional (WASM ~8 MB, lazy) -->
+<script>
+  function loadOpenCV() {
+    if (window._cvLoading) return;
+    window._cvLoading = true;
+    const s = document.createElement('script');
+    s.src   = 'https://docs.opencv.org/4.8.0/opencv.js';
+    s.async = true;
+    s.onload = () => {
+      if (typeof cv !== 'undefined' && cv.Mat) {
+        window.onOpenCvReady?.();
+      } else if (typeof cv !== 'undefined') {
+        cv['onRuntimeInitialized'] = () => window.onOpenCvReady?.();
+      } else {
+        const t = setInterval(() => {
+          if (typeof cv !== 'undefined') {
+            clearInterval(t);
+            if (cv.Mat) window.onOpenCvReady?.();
+            else cv['onRuntimeInitialized'] = () => window.onOpenCvReady?.();
+          }
+        }, 200);
+      }
+    };
+    document.head.appendChild(s);
+  }
+  window.addEventListener('DOMContentLoaded', () => setTimeout(loadOpenCV, 300));
+</script>
+
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    // Sincronizar radio buttons → hidden input #gen-layout
+    document.querySelectorAll('input[name="gen-layout-radio"]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        document.getElementById('gen-layout').value = radio.value;
+      });
+    });
+
+    // Botão "Nova Prova" no estado vazio
+    document.getElementById('btn-new-exam-empty')?.addEventListener('click', () => {
+      document.getElementById('btn-new-exam').click();
+    });
+  });
+</script>
+
+<!-- App (ES module) -->
+<script type="module" src="js/app.js?v=19"></script>
+
+<!-- Service Worker -->
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+</script>
+
+</body>
+</html>
