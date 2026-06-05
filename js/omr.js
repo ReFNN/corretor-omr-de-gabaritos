@@ -13,7 +13,7 @@
 import {
   BLUR_K, ADAPT_BLOCK, ADAPT_C,
   FILL_MIN, MARGIN_MIN, ROI_FACTOR,
-} from './layout.js?v=19';
+} from './layout.js?v=21';
 
 // ─── Utilitários internos ─────────────────────────────────────────────────────
 

@@ -14,7 +14,7 @@ import {
   BUBBLE_R       as FULL_BR,
   getMarkerPositions    as fullMarkers,
   getBubbleCoords       as fullBubbles,
-} from './layout.js?v=19';
+} from './layout.js?v=21';
 
 import {
   CANON_H    as COMP_H,
@@ -23,7 +23,7 @@ import {
   getCanonW            as compGetCanonW,
   getMarkerPositions   as compMarkers,
   getBubbleCoords      as compBubbles,
-} from './layout-compact.js?v=19';
+} from './layout-compact.js?v=21';
 
 // ─── Utilitário comum ──────────────────────────────────────────────────────────
 
@@ -87,9 +87,11 @@ function drawCardFull(canvas, exam) {
   ctx.fillStyle = '#555';
   ctx.fillText('Preencha completamente a bolha com caneta. Não rasure.', hdrX, hdrY + 110 * sy);
 
-  // Marcadores de coluna removidos: os pequenos quadrados pretos acima/abaixo de cada
-  // coluna são confundidos pelo detector com os 4 marcadores fiduciais de canto,
-  // causando warp incorreto. O warp global pelos 4 cantos é suficiente para a leitura.
+  // Marcadores de coluna REMOVIDOS permanentemente:
+  // os quadradinhos pretos acima/abaixo de cada coluna são detectados como
+  // candidatos a marcador fiducial, formando grupos falsos de 4 elementos
+  // e causando warp completamente errado. Testado em v20 — confirmado o problema.
+  // O warp global pelos 4 marcadores de canto é suficiente para leitura correta.
 
   // Cabeçalho de alternativas por coluna
   const questions = fullBubbles(n, opt);

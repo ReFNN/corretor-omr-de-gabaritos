@@ -4,12 +4,12 @@
  * Múltiplos gabaritos persistidos no IndexedDB.
  */
 
-import { saveExam, getExams, deleteExam, saveResult } from './db.js?v=19';
-import { drawCard, randomKey, printCard }              from './generator.js?v=19';
-import { runOMR, analyzeFrame }                        from './omr.js?v=19';
-import { STABLE_FRAMES, LIVE_WIDTH }                   from './layout.js?v=19';
-import * as LayoutFull    from './layout.js?v=19';
-import * as LayoutCompact from './layout-compact.js?v=19';
+import { saveExam, getExams, deleteExam, saveResult } from './db.js?v=21';
+import { drawCard, randomKey, printCard }              from './generator.js?v=21';
+import { runOMR, analyzeFrame }                        from './omr.js?v=21';
+import { STABLE_FRAMES, LIVE_WIDTH }                   from './layout.js?v=21';
+import * as LayoutFull    from './layout.js?v=21';
+import * as LayoutCompact from './layout-compact.js?v=21';
 
 // ─── Toast (notificação não-bloqueante) ────────────────────────────────────────
 function showToast(msg, type = 'info') {
