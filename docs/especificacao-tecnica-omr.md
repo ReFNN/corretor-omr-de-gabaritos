@@ -1,503 +1,413 @@
 # Corretor OMR — Especificação Técnica
 
-> Versão do protótipo: 1.0  
-> Data: 2026-06-03  
-> Tecnologia principal: OpenCV.js + Vanilla JS (ES Modules) + PWA
+> Versão do protótipo: **2.0** (corresponde ao código `?v=38`)
+> Data: 2026-06-06
+> Tecnologia principal: OpenCV.js 4.8.0 (WASM) + JavaScript Vanilla (ES Modules) + PWA
+
+Este documento descreve **tudo** o que o protótipo usa: arquitetura, os dois layouts de cartão, todos os parâmetros, o pipeline de visão computacional, limites e persistência. Os valores aqui refletem o código-fonte atual.
 
 ---
 
 ## 1. Visão Geral
 
-O sistema é um **leitor óptico de gabaritos (OMR — Optical Mark Recognition)** que funciona inteiramente no navegador, sem backend. O usuário fotografa um cartão-resposta impresso com a câmera do celular; o sistema detecta os marcadores fiduciais nos cantos, corrige a perspectiva da imagem, lê o preenchimento de cada bolha e compara com o gabarito configurado.
+Leitor óptico de gabaritos (OMR — *Optical Mark Recognition*) que roda **inteiramente no navegador**, sem backend e offline (PWA). O usuário gera/imprime um cartão-resposta, o aluno preenche, e a câmera lê e corrige contra o gabarito.
 
 ### Fluxo geral
 
 ```
-Câmera → Frame de vídeo → Detecção de marcadores → Warp de perspectiva
-→ Binarização adaptativa → Amostragem de bolhas → Decisão por questão
-→ Correção contra gabarito → Resultado (score + tabela + imagem anotada)
+Câmera → frame de vídeo → detecção dos marcadores → (warp provisório)
+→ orientação pelo furo da âncora (pós-warp) → warp final
+→ binarização adaptativa → amostragem das bolhas → decisão por questão
+→ correção contra gabarito → resultado (score + tabela + imagem anotada)
 ```
 
 ### Arquitetura de arquivos
 
 | Arquivo | Responsabilidade |
 |---|---|
-| `js/layout.js` | **Fonte única de verdade** — todas as constantes de layout e coordenadas |
-| `js/generator.js` | Geração do cartão-resposta em canvas (impressão) |
-| `js/omr.js` | Pipeline completo de detecção, warp, leitura e correção |
-| `js/app.js` | Controlador de telas, câmera, estado global |
-| `js/db.js` | Persistência IndexedDB para resultados |
-| `index.html` | SPA com 4 telas: Home, Captura, Resultado, Editor |
+| `js/layout.js` | Fonte de verdade do layout **página inteira (A4)** — constantes e coordenadas |
+| `js/layout-compact.js` | Fonte de verdade do layout **compacto** (largura adaptativa) |
+| `js/generator.js` | Renderização do cartão em canvas e impressão (despacha por `exam.layout`) |
+| `js/omr.js` | Pipeline completo: detecção, orientação, warp, binarização, leitura, correção |
+| `js/app.js` | Controlador de telas, câmera, captura ao vivo, limites por layout |
+| `js/db.js` | Persistência IndexedDB (provas + resultados) |
+| `index.html` | Telas: Home, Captura, Resultado, Editor de gabarito |
+| `sw.js` / `manifest.json` | Service worker (cache offline) e manifesto PWA |
+
+### Princípio do espaço canônico
+
+Cada layout define um **espaço canônico de referência**. Gerador e leitor usam exatamente as mesmas funções (`getMarkerPositions`, `getBubbleCoords`, `getColMarkerPositions`) — assim as bolhas impressas caem precisamente onde o leitor as procura. **Nunca** duplicar constantes fora do módulo de layout.
 
 ---
 
-## 2. Espaço Canônico
+## 2. Os Dois Layouts
 
-O sistema trabalha com um **espaço canônico de referência** de dimensões fixas. Todos os cálculos de posição — geração e leitura — usam essas coordenadas. Isso garante que o gerador e o leitor nunca divirjam.
-
-| Constante | Valor | Significado |
+| Aspecto | Página inteira (`full`) | Compacto (`compact`) |
 |---|---|---|
-| `CANON_W` | **1000 u** | Largura canônica |
-| `CANON_H` | **1414 u** | Altura canônica |
-| Proporção | **1 : 1.414** | Equivale exatamente a A4 retrato (210 × 297 mm) |
-| `MARGIN` | **60 u** | Margem interna mínima em todos os lados |
+| Módulo | `layout.js` | `layout-compact.js` |
+| Orientação | Retrato (A4) | Paisagem |
+| Espaço canônico | **1000 × 1414** (fixo) | **largura adaptativa × 460** |
+| Cabeçalho | Sim (título, ID, aluno, data, instrução) | Não (só marcadores + grade) |
+| Marcadores de coluna | **Sim** (`HAS_COL_MARKERS = true`) | Não (`false`) |
+| Estratégia de warp | Pelos **4 marcadores** (`USE_BORDER_WARP = false`) | Pela **borda** do cartão (`true`) |
+| Calibração de linha por coluna | Sim (`refineWithColMarkers`) | Não |
+| Máx. de questões | 100–175 (depende das alternativas, ver §8) | **30** |
+| `STABLE_FRAMES` (auto-disparo) | 6 (~0,2 s) | 15 (~0,5 s) |
+| `LIVE_WIDTH` (frame ao vivo) | **800 px** | 420 px |
+| Impressão | A4 retrato cheio | ~190 mm de largura, altura proporcional (~⅓ de página) |
 
-A escala canônica → física: `1 u = 210mm / 1000 = 0.21 mm`
+Justificativas de design:
+- **Warp pela borda só no compacto** porque sua borda é preta e nítida (cantos precisos); a borda do A4 é cinza-clara e fina (não confiável) → A4 usa os 4 marcadores.
+- **`LIVE_WIDTH` maior no A4** porque o cartão retrato fica pequeno num quadro de câmera paisagem; a 420 px os marcadores ficavam ~7 px (indetectáveis); a 800 px ficam ~13 px.
+- **`STABLE_FRAMES` maior no compacto** porque o cartão menor é mais sensível ao tremor.
 
 ---
 
-## 3. Marcadores Fiduciais
+## 3. Espaço Canônico
 
-Quatro marcadores pretos são impressos nos cantos do cartão. São usados para:
-1. Detectar que o cartão está no enquadramento
-2. Calcular a transformação de perspectiva para o espaço canônico
-3. Identificar a orientação do cartão (portrait/landscape/invertido)
+### 3.1 Página inteira (`layout.js`)
 
-### Especificações físicas
-
-| Parâmetro | Canônico | Físico (A4) |
+| Constante | Valor | Físico (A4, 1 u = 0,21 mm) |
 |---|---|---|
-| `MARKER_SIZE` | **40 u** | **8.4 mm** de lado |
-| `MARKER_INSET` | **36 u** | **7.56 mm** da borda do papel |
-| Centro do marcador | `INSET + SIZE/2 = 56 u` | **11.76 mm** da borda |
-| Furo interno (âncora) | `40 × 0.40 = 16 u` | **3.36 mm** de lado |
+| `CANON_W` | 1000 u | 210 mm |
+| `CANON_H` | 1414 u | 297 mm (proporção 1:1.414) |
+| `MARGIN` | 60 u | 12,6 mm |
 
-### Posições dos centros (espaço canônico)
+### 3.2 Compacto (`layout-compact.js`)
 
-| Marcador | X | Y | Tipo |
-|---|---|---|---|
-| TL (topo-esquerda) | 56 | 56 | Quadrado sólido |
-| TR (topo-direita) | 944 | 56 | Quadrado sólido |
-| BL (base-esquerda) | 56 | 1358 | Quadrado sólido |
-| **BR (base-direita)** | **944** | **1358** | **Âncora — quadrado com buraco interno** |
+Altura fixa, **largura calculada a partir do conteúdo**:
 
-### Marcador âncora (BR)
-
-O marcador BR possui um **quadrado branco interno** de 40% do seu tamanho (3.36 mm). No mapa de contornos do OpenCV (`RETR_TREE`), esse buraco aparece como contorno filho (`hasChild = true`), o que permite identificar unicamente esse canto e determinar a orientação do cartão.
-
-**Por que o âncora é crítico:** Um cartão pode ser fotografado em 4 orientações (0°, 90°, 180°, 270°). O âncora no canto BR é o único marcador assimétrico — ele sempre identifica qual canto é qual.
-
----
-
-## 4. Layout do Cabeçalho
-
-| Parâmetro | Valor canônico |
+| Constante | Valor |
 |---|---|
-| `HEADER_H` | **280 u** (primeiros 280 pixels de altura) |
-| Conteúdo | Título, ID, nº questões/alternativas, linha Aluno, linha Data, instrução |
+| `CANON_H` | 460 u |
+| `SIDE_MARGIN` | 68 u (margem lateral em cada lado) |
+| `LABEL_W` | 36 u (largura do número da questão) |
+| `OPT_GAP` | 38 u (distância centro-a-centro entre bolhas) |
+| `COL_GAP` | 48 u (espaço extra entre colunas) |
 
-O cabeçalho ocupa a região Y: 0 → 280 u. A área de bolhas começa em `GRID_TOP = 340 u` (após uma margem de separação de 60 u abaixo do cabeçalho).
+Cálculo da largura (`getCanonW`):
+```
+larguraConteudoColuna(opt) = LABEL_W + 6 + BUBBLE_R + (opt-1)*OPT_GAP + BUBBLE_R
+                           = 64 + (opt-1)*38
+cols    = ceil(n / maxRows)              # maxRows = 10 (ver §5.2)
+totalW  = cols*colW + (cols-1)*COL_GAP
+canonW  = 2*SIDE_MARGIN + totalW
+```
+Exemplos (5 alternativas): 1 coluna → `canonW = 352`; 3 colunas (30 questões) → `canonW = 880`.
+
+---
+
+## 4. Marcadores Fiduciais
+
+Quatro quadrados pretos nos cantos. **BR é a âncora** — tem um furo (quadrado branco interno de 40% do lado). O furo identifica unicamente o canto inferior-direito e, portanto, a orientação.
+
+| Parâmetro | Página inteira | Compacto |
+|---|---|---|
+| `MARKER_SIZE` | 40 u (8,4 mm) | 32 u |
+| `MARKER_INSET` | 36 u | 8 u |
+| Centro (inset + size/2) | 56 u das bordas | 24 u das bordas |
+| Furo da âncora (40%) | 16 u | ~13 u |
+
+Posições dos centros (`getMarkerPositions`):
+```
+tl = (cx, cy)                 tr = (W - cx, cy)
+bl = (cx, H - cy)             br = (W - cx, H - cy)   ← âncora
+```
+onde `cx = cy = MARKER_INSET + MARKER_SIZE/2`. Para o A4: TL(56,56) TR(944,56) BL(56,1358) BR(944,1358).
 
 ---
 
 ## 5. Grade de Bolhas
 
-### Parâmetros
+### 5.1 Página inteira
 
 | Constante | Valor | Físico |
 |---|---|---|
-| `GRID_TOP` | **340 u** | Início da grade (Y) |
-| `GRID_BOTTOM` | **1324 u** | `CANON_H - 90` |
-| `ROW_H` | **40 u** | Altura por linha de questão = **8.4 mm** |
-| `BUBBLE_R` | **11 u** | Raio da bolha = **2.31 mm** (diâmetro **4.62 mm**) |
-| `LABEL_W` | **44 u** | Largura da coluna do número da questão |
+| `HEADER_H` | 264 u | região do cabeçalho |
+| `GRID_TOP` | 285 u | início da grade |
+| `GRID_BOTTOM` | `CANON_H - 90` = 1324 u | fim da grade |
+| `ROW_H` | 40 u | 8,4 mm por linha |
+| `BUBBLE_R` | 11 u | raio (Ø 4,62 mm) |
+| `LABEL_W` | 44 u | coluna do número |
 
-### Capacidade por coluna
+Linhas por coluna = `floor((1324 − 285) / 40) = 25`.
+`optGap = min(46, (colW − LABEL_W − 24) / opt)`; `startX = colX + LABEL_W + BUBBLE_R + 6`.
 
-```
-Área disponível = GRID_BOTTOM - GRID_TOP = 1324 - 340 = 984 u
-Questões por coluna = floor(984 / ROW_H) = floor(984 / 40) = 24 questões
-```
+### 5.2 Compacto
 
-### Número de colunas
+| Constante | Valor |
+|---|---|
+| `GRID_TOP` | 60 u |
+| `GRID_BOTTOM` | 400 u |
+| `ROW_H` | 34 u |
+| `BUBBLE_R` | 11 u |
 
-O layout distribui automaticamente as questões em múltiplas colunas quando necessário:
+Linhas por coluna = `floor((400 − 60) / 34) = 10`.
 
-```
-colunas = ceil(n / 24)
-questões por coluna = ceil(n / colunas)
-largura por coluna = (CANON_W - 2 × MARGIN) / colunas = 880 / colunas
-```
-
-Exemplos:
-
-| Questões | Colunas | Questões/coluna |
-|---|---|---|
-| 1 – 24 | 1 | até 24 |
-| 25 – 48 | 2 | até 24 |
-| 49 – 72 | 3 | até 24 |
-| 73 – 100 | 5 | até 20 |
-
-### Posicionamento das bolhas (1 coluna, 5 alternativas)
-
-```
-optGap = min(46, (880 - 44 - 24) / 5) = min(46, 162.4) = 46 u = 9.66 mm entre centros
-startX = MARGIN + LABEL_W + BUBBLE_R + 6 = 60 + 44 + 11 + 6 = 121 u
-
-A: x = 121 u  (25.4 mm do esquerdo)
-B: x = 167 u  (35.1 mm)
-C: x = 213 u  (44.7 mm)
-D: x = 259 u  (54.4 mm)
-E: x = 305 u  (64.1 mm)
-```
-
-### Cabeçalho de colunas
-
-As letras A, B, C, D, E são impressas em negrito **acima** da primeira questão de cada coluna (`y = primeiraQuestão.labelY - 22 u`). Não há letras dentro das bolhas — as bolhas são círculos vazios limpos.
+### 5.3 Cabeçalho de alternativas
+As letras A–E são impressas em negrito **acima** da primeira questão de cada coluna (`y = labelY − 22`). As bolhas são círculos vazios (sem letra dentro).
 
 ---
 
-## 6. Qualidade de Impressão
+## 6. Marcadores de Coluna (só página inteira)
+
+Pequenos quadrados pretos acima da primeira e abaixo da última questão de **cada coluna**. Servem para **calibrar o espaçamento vertical de cada coluna** após o warp (corrige distorções residuais).
+
+| Constante | Valor |
+|---|---|
+| `COL_MARKER_SIZE` | 14 u |
+| `COL_MARKER_GAP` | 6 u (do marcador à borda da grade) |
+
+Posições por `getColMarkerPositions(n, opt)` (centro em `colX + COL_MARKER_SIZE/2`, topo/base deslocados de `ROW_H/2 + GAP + SIZE/2`).
+
+> ⚠️ Estes marcadores **não** são usados para o warp. A detecção dos 4 cantos os ignora por construção (ver §9.3). No compacto eles foram removidos por interferirem e por não caberem bem.
+
+---
+
+## 7. Borda do Cartão (warp do compacto)
+
+O compacto imprime uma **borda preta** (`strokeRect`, 1,5 px) rente à borda canônica. O leitor a detecta e usa seus 4 cantos para o warp — pontos grandes e distantes dão uma homografia bem mais estável que os 4 quadradinhos. Ver §9.5.
+
+---
+
+## 8. Limites de Questões
+
+### Compacto
+`COMPACT_MAX_Q = 30` (3 colunas × 10 linhas).
+
+### Página inteira (`fullMaxQuestions(opt)` em `app.js`)
+```
+rowsPerCol = 25
+availW     = 880                  # CANON_W - 2*MARGIN
+minColW    = opt*24 + 68          # opt*(2*BUBBLE_R+2) + LABEL_W + 24
+maxCols    = floor(availW / minColW)
+máximo     = maxCols * 25
+```
+
+| Alternativas | `minColW` | Colunas | **Máx. questões** |
+|---|---|---|---|
+| 5 | 188 | 4 | **100** |
+| 4 | 164 | 5 | **125** |
+| 3 | 140 | 6 | **150** |
+| 2 | 116 | 7 | **175** |
+
+O campo de questões no editor ajusta o `max` dinamicamente conforme layout e alternativas (`refreshQuestionsLimit`).
+
+---
+
+## 9. Pipeline OMR — Detalhado
+
+### 9.1 Captura de imagem
+- `getUserMedia`: `facingMode: environment`, `width: 1920`, `height: 1080` (ideais).
+- **Frame ao vivo:** reduzido a `LIVE_WIDTH` (800 full / 420 compacto), proporção 16:9; `getImageData` com `willReadFrequently: true`.
+- **Captura final:** resolução nativa (`videoWidth × videoHeight`).
+
+### 9.2 Detecção de candidatos (`detectMarkers`)
+```
+1. RGBA → cinza
+2. GaussianBlur 5×5 (BLUR_K)
+3. threshold Otsu (THRESH_BINARY_INV)   → tinta preta vira branco (255)
+4. findContours (RETR_TREE, CHAIN_APPROX_SIMPLE)
+```
+Filtro por contorno:
+
+| Critério | Condição |
+|---|---|
+| Área | `imgArea*0.0001 ≤ area ≤ imgArea*0.04` |
+| Forma | `approxPolyDP(0.05*perímetro)` → 4 vértices |
+| Proporção | `0.6 < w/h < 1.6` |
+| **Solidez** | `area / (w*h) > 0.80` → distingue **quadrado sólido** (marcador) de **anel** (bolha vazia) |
+| Âncora (`hasChild`) | filho presente **e** `0.02*area < áreaDoFilho < 0.35*area` → furo pequeno/centrado (não anel de bolha) |
+
+A solidez e o critério de tamanho do furo eliminam as bolhas (que são anéis com furo grande) — antes elas viravam falsas âncoras.
+
+### 9.3 Seleção dos 4 cantos (`identifyMarkers`)
+1. **Primário — extremos:** os 4 pontos extremos da nuvem (`tl=min(x+y)`, `br=max(x+y)`, `tr=max(x−y)`, `bl=min(x−y)`). Como o cartão preenche o quadro, os cantos são os extremos; marcadores de coluna/bolhas (interiores) são ignorados por construção.
+2. **Fallback — ancorado:** para cada candidato com furo, filtra candidatos de tamanho semelhante (±4× área) e faz força-bruta entre eles.
+3. **Fallback — força-bruta** sobre os maiores quadrados (até 16, C(16,4)=1820 combinações).
+
+Validação geométrica (`validateGroup`, só geometria):
+- razão de áreas dos 4 ≤ 4;
+- **não colinear:** bbox dos 4 pontos com `min(largura,altura)/max ≥ 0.30`;
+- proporção (lados) ≥ 0.30 (aceita retrato e paisagem);
+- diagonal do quad ≥ 25% da diagonal da imagem.
+
+### 9.4 Orientação pela âncora (pós-warp — `detectAnchorCornerInWarp`)
+A seleção dos cantos não depende do furo (a 420 px ele some). A orientação é decidida **depois de um warp provisório**, onde o furo aparece grande (~13 px):
+```
+1. warp provisório (orientação por extremos)
+2. amostra o CENTRO dos 4 cantos canônicos na imagem retificada
+3. âncora = canto de centro mais claro (furo branco), exigindo margem ≥ 40 (0–255)
+4. se a âncora não caiu em BR → reatribui papéis por orientByAnchorPoint
+   (BR = âncora; TL = mais distante; TR/BL pelo lado da diagonal, via produto vetorial)
+   e refaz o warp
+```
+Robusto a qualquer rotação (0/90/180/270 e intermediárias).
+
+### 9.5 Warp de perspectiva
+- **Página inteira (`warpToCanonical`):** `getPerspectiveTransform(marcadores → getMarkerPositions)`, saída 1000×1414.
+- **Compacto (`warpByBorder`):** detecta a borda (`detectCardBorder`) e mapeia seus cantos → retângulo canônico `(0,0)–(canonW,canonH)`.
+  - `detectCardBorder`: contornos `RETR_LIST`, `area ≥ 3% da imagem`, `approxPolyDP(0.02*perímetro)` convexo de 4 lados; aceita só o quad cujos 4 cantos **abraçam** os marcadores (cada canto a ≤ 20% da diagonal dos marcadores). Se nenhum casar → cai no warp por marcadores.
+
+### 9.6 Binarização (`binarize`)
+```
+GaussianBlur 5×5 → adaptiveThreshold(GAUSSIAN_C, BINARY_INV, block=25, C=7)
+```
+Tinta escura → 255; papel → 0. Adaptativa para tolerar iluminação desigual.
+
+### 9.7 Calibração por coluna (`refineWithColMarkers`, só página inteira)
+Para cada coluna, procura os marcadores de coluna (±22 u em torno da posição nominal, exigindo `minWhite = SIZE²*0.25`) e recalcula o espaçamento vertical das linhas.
+**Trava de sanidade:** se o espaçamento calibrado sair de `0.7×–1.3× ROW_H`, descarta (mantém o nominal). Só roda se `layoutMod.HAS_COL_MARKERS`.
+
+### 9.8 Amostragem das bolhas (`sampleBubbles`)
+```
+ROI = quadrado de lado 2*ceil(BUBBLE_R * ROI_FACTOR) = 2*ceil(11*0.65)=16 px, centrado na bolha
+fillRatio = countNonZero(ROI) / área
+```
+`ROI_FACTOR = 0.65` amostra só o interior (evita a borda impressa do círculo).
+
+### 9.9 Decisão por questão (`decideAnswers`)
+
+| Status | Condição |
+|---|---|
+| `ok` | 1 bolha ≥ `FILL_MIN` **e** (1ª − 2ª) ≥ `MARGIN_MIN` |
+| `low_conf` | 1 bolha ≥ `FILL_MIN` mas margem < `MARGIN_MIN`; ou nenhuma ≥ `FILL_MIN` mas `max ≥ FILL_MIN*0.7` |
+| `blank` | nenhuma ≥ `FILL_MIN` **e** `max < FILL_MIN*0.7` (= 0.28) |
+| `multi` | 2+ bolhas ≥ `FILL_MIN` |
+
+`FILL_MIN = 0.40`, `MARGIN_MIN = 0.10`.
+
+### 9.10 Correção (`gradeAnswers`)
+```
+right = (status === 'ok') && (marked === gabarito[q-1].toUpperCase())
+score = nº de right;  pct = round(score/total*100)
+```
+Só `ok` conta como acerto; `blank`/`multi`/`low_conf` são erro.
+
+### 9.11 Anotação (`annotateCanvas`)
+Círculo grosso na bolha marcada (verde = certo, vermelho = errado, cinza = branco-mas-marcado); círculo fino verde na alternativa correta quando o aluno errou.
+
+---
+
+## 10. Quality Gate — Captura ao Vivo (`liveDetectionLoop`)
+
+Acumula um contador de estabilidade; dispara ao atingir `STABLE_FRAMES`. Tolerante a tremor e a piscas de detecção:
+
+| Parâmetro | Valor | Papel |
+|---|---|---|
+| `STABLE_FRAMES` | 6 (full) / 15 (compacto) | frames estáveis para auto-disparo |
+| `MAX_DRIFT` | 45 px | tolerância de tremor entre frames (no frame reduzido) |
+| `MAX_MISS` | 12 | transientes (pisca/tremor) tolerados antes de resetar (~0,4 s) |
+| `SHARP_MIN` | 80 | variância mínima do Laplaciano (nitidez) |
+
+Lógica:
+- **Estável** (marcadores válidos + dentro de `MAX_DRIFT`): incrementa o contador; se borrado (`< SHARP_MIN`) segura o contador e aguarda foco; ao zerar o restante, **dispara**.
+- **Transiente** (pisca de detecção **ou** pulo de tremor além de `MAX_DRIFT`): **não reseta** — segura o progresso por até `MAX_MISS` frames (mantendo a referência) e continua desenhando os marcadores (sem blink). Só reseta se a perda/movimento for **sustentado**.
+- **Captura manual:** botão "📸 Capturar" ignora o gate.
+
+Nitidez: `Laplacian(cinza)` → `stdDev²`; `< 80` = borrado.
+
+---
+
+## 11. Geração / Impressão
 
 | Parâmetro | Valor |
 |---|---|
-| Resolução do canvas | **2079 × 2940 px** |
-| DPI equivalente | **~250 DPI** para A4 (210 mm) |
-| Exibição na tela | CSS `width: 520px` (escalonado via CSS; `toDataURL` usa resolução real) |
-| Formato de saída | PNG via `canvas.toDataURL('image/png')` |
-| Instrução de impressão | "Tamanho 100%, sem ajustar à página" (crucial para escala correta) |
+| `PRINT_W` | 2079 px (~250 DPI em 210 mm) |
+| Página inteira | 2079 × 2940 px (A4 retrato) |
+| Compacto | `canonW*2.079 × 460*2.079` (largura adaptativa) |
+| Exibição na tela | CSS `width ≤ 520px` (resolução real preservada no `toDataURL`) |
+| Saída | PNG (`toDataURL('image/png')`) |
+| Impressão compacto | `width: 190mm`, altura automática, margem 10 mm |
+| Impressão A4 | `210mm × 297mm`, `@page margin 0` |
 
-> **Atenção:** Se a impressora escalar o cartão (opção "ajustar à página" ativada), os marcadores ficam em posições físicas ligeiramente erradas e o warp de perspectiva perde precisão.
-
----
-
-## 7. Pipeline OMR — Detalhamento Completo
-
-### 7.1 Captura de imagem
-
-- **Resolução solicitada:** `width: 1920, height: 1080` (via `getUserMedia`)
-- **Detecção ao vivo:** frame reduzido a `LIVE_WIDTH = 420 px` (largura), proporção 16:9 → 420 × 236 px para processamento em tempo real
-- **Captura final:** resolução nativa da câmera (`videoWidth × videoHeight`)
-
-### 7.2 Detecção de Marcadores (`detectMarkers`)
-
-**Pré-processamento:**
-```
-1. Converter para escala de cinza (RGBA → GRAY)
-2. GaussianBlur kernel 5×5 (BLUR_K = 5)
-3. Threshold de Otsu (THRESH_BINARY_INV)
-   → Papel branco: 0 (preto)
-   → Tinta preta: 255 (branco)
-4. findContours (RETR_TREE, CHAIN_APPROX_SIMPLE)
-```
-
-**Filtro de candidatos:** Para cada contorno encontrado:
-
-| Critério | Condição | Motivo |
-|---|---|---|
-| Área mínima | `area ≥ imgArea × 0.0001` | Elimina ruído sub-pixel |
-| Área máxima | `area ≤ imgArea × 0.04` | Elimina grandes regiões de fundo |
-| Forma | `approxPolyDP(5% × perímetro) = 4 vértices` | Seleciona apenas quadriláteros |
-| Proporção | `0.6 < width/height < 1.6` | Garante forma aproximadamente quadrada |
-| `hasChild` | Registrado para cada candidato | Indica buraco interno (âncora) |
-
-**Busca por combinações (`identifyMarkers`):**
-
-Para evitar falsos positivos (bordas da mesa, padrões do fundo), o algoritmo não simplesmente pega os 4 maiores candidatos. Em vez disso:
-
-```
-1. Ordenar candidatos por área CRESCENTE
-   (marcadores do cartão tendem a ser menores que features grandes do fundo)
-
-2. Testar todas as combinações C(min(N,15), 4) — máximo 1365 iterações
-   Poda: se maior/menor área do grupo > 4×, interrompe (marcadores têm tamanho similar)
-
-3. Para cada grupo de 4, executar checkGroupAsMarkers():
-   a. Rejeitar se 2+ candidatos têm hasChild = true
-      (bolhas vazias também têm hasChild; o grupo válido tem exatamente 0 ou 1 âncora)
-   b. Calcular centróide dos 4 pontos
-   c. Classificar em 4 quadrantes: TL, TR, BL, BR
-   d. Rejeitar se algum quadrante tem ≠ 1 candidato
-   e. Se âncora encontrado (hasChild=1): testar 4 rotações para colocar âncora no slot BR
-   f. Validar proporção: min(largura,altura)/max(largura,altura) ≥ 0.35
-      (aceita portrait, landscape e 180° invertido)
-   g. Validar cobertura: diagonal do quad ≥ 30% da diagonal da imagem
-      (rejeita detecções em objetos pequenos distantes)
-
-4. Retornar o primeiro grupo válido encontrado (menor conjunto de marcadores válido)
-```
-
-### 7.3 Detecção de Orientação
-
-| Situação | Ação |
-|---|---|
-| Âncora detectado, já no slot BR | Sem rotação — orientação padrão portrait |
-| Âncora no slot BL (card landscape CCW) | Rotação 90° CCW no mapeamento |
-| Âncora no slot TL (card invertido 180°) | Rotação 180° no mapeamento |
-| Âncora no slot TR (card landscape CW) | Rotação 90° CW no mapeamento |
-| Sem âncora detectado | Fallback por posição (assume portrait) |
-
-As 4 rotações testadas no mapeamento canônico:
-
-```js
-rot0 (0°):   { tl, tr, bl, br }
-rot1 (90°CW):  { tl: bl, tr: tl, bl: br, br: tr }
-rot2 (180°):   { tl: br, tr: bl, bl: tr, br: tl }
-rot3 (90°CCW): { tl: tr, tr: br, bl: tl, br: bl }
-```
-
-### 7.4 Warp de Perspectiva (`warpToCanonical`)
-
-```
-srcPts = [detected_TL, detected_TR, detected_BL, detected_BR]
-dstPts = [canonical_TL=(56,56), canonical_TR=(944,56),
-          canonical_BL=(56,1358), canonical_BR=(944,1358)]
-
-M = getPerspectiveTransform(srcPts, dstPts)
-warped = warpPerspective(src, M, size=(1000, 1414))
-```
-
-Resultado: imagem canônica de **1000 × 1414 px**, retrato, sem distorção de perspectiva. A partir daqui, todas as coordenadas são diretas (sem conversão de escala).
-
-### 7.5 Binarização Adaptativa (`binarize`)
-
-```
-1. GaussianBlur 5×5 sobre a imagem canônica em cinza
-2. adaptiveThreshold:
-   - Método: ADAPTIVE_THRESH_GAUSSIAN_C
-   - Tipo: THRESH_BINARY_INV
-   - Block size: 25 px (ADAPT_BLOCK)
-   - Constante C: 7 (ADAPT_C)
-```
-
-**Resultado:**
-- Papel branco → `0` (preto)
-- Tinta/marcação escura → `255` (branco)
-
-A binarização adaptativa (vs. global) é essencial para lidar com iluminação desigual — sombras e variações de luz que são inevitáveis em fotografias com celular.
-
-### 7.6 Amostragem das Bolhas (`sampleBubbles`)
-
-Para cada bolha em cada questão, calculada com `getBubbleCoords(n, opt)`:
-
-```
-ROI_radius = ceil(BUBBLE_R × ROI_FACTOR) = ceil(11 × 0.65) = ceil(7.15) = 8 px
-ROI = quadrado de (2 × 8) = 16 × 16 = 256 pixels centrado em (b.x, b.y)
-
-fillRatio = countNonZero(patch) / 256
-           = pixels brancos (tinta) / área total
-```
-
-**Por que ROI_FACTOR = 0.65 e não 1.0?**
-
-Com `ROI_FACTOR = 1.0`, o ROI abrangeria a borda impressa do círculo (linha preta). Essa borda, após binarização, gera pixels brancos que inflam o `fillRatio` de bolhas vazias. Com `0.65`, o ROI captura **apenas o interior** da bolha — onde está (ou não está) a marcação do aluno:
-
-```
-Bolha vazia    → interior = papel branco → 0 na binária → fillRatio ≈ 0.00 – 0.05
-Bolha marcada  → interior = tinta escura → 255 na binária → fillRatio ≈ 0.65 – 0.90
-```
-
-### 7.7 Decisão por Questão (`decideAnswers`)
-
-| Status | Condição | Significado |
-|---|---|---|
-| `ok` | 1 bolha ≥ 0.40 E (1ª − 2ª) ≥ 0.10 | Resposta clara e única |
-| `low_conf` | 1 bolha ≥ 0.40 mas margem < 0.10 | Marcação limítrofe |
-| `blank` | Nenhuma bolha ≥ 0.40 E max < 0.28 | Questão em branco |
-| `low_conf` | Nenhuma ≥ 0.40 mas max ≥ 0.28 | Traço fraco / indefinido |
-| `multi` | 2+ bolhas ≥ 0.40 | Múltiplas marcações |
-
-Parâmetros de decisão:
-
-| Constante | Valor | Papel |
-|---|---|---|
-| `FILL_MIN` | **0.40** | Limiar mínimo para considerar bolha marcada |
-| `MARGIN_MIN` | **0.10** | Diferença mínima 1ª → 2ª para status `ok` |
-
-**Faixa de segurança observada empiricamente:**
-
-```
-Bolha vazia (fundo/letra âncora): 0.00 – 0.31
-Zona de ambiguidade:              0.31 – 0.40  ← FILL_MIN fica aqui
-Bolha marcada (caneta):           0.65 – 0.90
-```
-
-### 7.8 Correção contra Gabarito (`gradeAnswers`)
-
-```
-Para cada questão q (1 a n):
-  correct = gabarito[q-1].toUpperCase()
-  right   = (status === 'ok') AND (marked === correct)
-
-score = count(answers where right = true)
-pct   = round(score / total × 100)
-```
-
-Apenas respostas com status `ok` são contadas como acertos. Respostas `blank`, `multi` e `low_conf` são sempre erros.
+> ⚠️ Imprimir a **100% (sem "ajustar à página")** — escalonamento desloca os marcadores e degrada o warp.
 
 ---
 
-## 8. Quality Gate — Detecção ao Vivo
+## 12. Parâmetros Completos (referência)
 
-Antes do auto-disparo, o sistema verifica 4 condições em sequência. Todas devem ser satisfeitas por `STABLE_FRAMES = 5` frames consecutivos:
+### 12.1 `layout.js` (página inteira)
+`CANON_W=1000`, `CANON_H=1414`, `MARGIN=60`, `MARKER_SIZE=40`, `MARKER_INSET=36`, `HEADER_H=264`, `GRID_TOP=285`, `GRID_BOTTOM=1324`, `ROW_H=40`, `BUBBLE_R=11`, `LABEL_W=44`, `USE_BORDER_WARP=false`, `HAS_COL_MARKERS=true`, `COL_MARKER_SIZE=14`, `COL_MARKER_GAP=6`, `STABLE_FRAMES=6`, `LIVE_WIDTH=800`.
 
-| Gate | Condição | Mensagem ao usuário |
-|---|---|---|
-| 1. Marcadores | 4 marcadores detectados e válidos | "🔍 Procurando marcadores nos cantos…" |
-| 2. Enquadramento | Todos os 4 marcadores dentro de 5% das bordas | "↔ Afaste-se para ver os 4 cantos" |
-| 3. Nitidez | Variância do Laplaciano ≥ `SHARP_MIN = 80` | "🔀 Imagem borrada — segure firme!" |
-| 4. Estabilidade | 5 frames passando gates 1+2+3 | "✓ Segure firme… (N)" |
+### 12.2 `layout-compact.js` (compacto)
+`CANON_H=460`, `SIDE_MARGIN=68`, `MARKER_SIZE=32`, `MARKER_INSET=8`, `GRID_TOP=60`, `GRID_BOTTOM=400`, `ROW_H=34`, `BUBBLE_R=11`, `LABEL_W=36`, `OPT_GAP=38`, `COL_GAP=48`, `COL_MARKER_SIZE=12`, `COL_MARKER_GAP=4`, `USE_BORDER_WARP=true`, `HAS_COL_MARKERS=false`, `STABLE_FRAMES=15`, `LIVE_WIDTH=420`.
 
-**Captura manual:** O botão "📸 Capturar" permite forçar a captura independente do quality gate — útil quando a detecção ao vivo falha mas o usuário sabe que o cartão está posicionado.
+### 12.3 OMR (compartilhados, ambos os layouts)
+`FILL_MIN=0.40`, `MARGIN_MIN=0.10`, `ROI_FACTOR=0.65`, `ADAPT_BLOCK=25`, `ADAPT_C=7`, `BLUR_K=5`, `SHARP_MIN=80`.
 
-**Cálculo de nitidez (sharpness):**
+### 12.4 Detecção (constantes no `omr.js`)
+minArea `0.0001*img`, maxArea `0.04*img`, approx `0.05*peri`, aspect `0.6–1.6`, solidez `>0.80`, furo da âncora `0.02–0.35` da área; bbox não-colinear `≥0.30`, proporção `≥0.30`, diagonal `≥0.25*imgDiag`; borda: area `≥0.03*img`, approx `0.02*peri`, cantos `≤0.20*markerDiag`; orientação pós-warp: margem de brilho `≥40`.
+
+### 12.5 Captura ao vivo (`app.js`)
+`MAX_DRIFT=45`, `MAX_MISS=12`, `COMPACT_MAX_Q=30`.
+
+---
+
+## 13. Persistência (IndexedDB)
+
+Banco `omr-corretor` (v1), dois object stores:
+
+**`exams`** — `keyPath: 'id'`
+```json
+{ "layout": "full|compact", "id": "...", "title": "...", "n": 20, "opt": 5, "k": "ABCDE..." }
 ```
-Laplacian(gray_frame) → stdDev² = variância
-Se variância < 80 → imagem borrada (motion blur ou foco ruim)
-```
 
----
-
-## 9. Parâmetros Completos
-
-### 9.1 Layout (layout.js)
-
-| Constante | Valor | Unidade |
-|---|---|---|
-| `CANON_W` | 1000 | px canônico |
-| `CANON_H` | 1414 | px canônico |
-| `MARGIN` | 60 | px canônico |
-| `MARKER_SIZE` | 40 | px canônico |
-| `MARKER_INSET` | 36 | px canônico |
-| `HEADER_H` | 280 | px canônico |
-| `GRID_TOP` | 340 | px canônico |
-| `GRID_BOTTOM` | 1324 | px canônico |
-| `ROW_H` | 40 | px canônico |
-| `BUBBLE_R` | 11 | px canônico |
-| `LABEL_W` | 44 | px canônico |
-
-### 9.2 OMR (layout.js)
-
-| Constante | Valor | Efeito ao aumentar | Efeito ao diminuir |
-|---|---|---|---|
-| `FILL_MIN` | 0.40 | Mais exigente → mais brancos | Mais sensível → mais falsos positivos |
-| `MARGIN_MIN` | 0.10 | Mais exigente → mais `low_conf` | Mais permissivo → menos `low_conf` |
-| `ROI_FACTOR` | 0.65 | Evita menos borda | Amostra interior menor → mais limpo mas pode perder marca leve |
-| `ADAPT_BLOCK` | 25 | Threshold mais global | Threshold mais local (sensível a variações micro) |
-| `ADAPT_C` | 7 | Mais conservador (menos falsos branco) | Mais agressivo (detecta marcas mais claras) |
-| `BLUR_K` | 5 | Mais suavização (menos ruído) | Menos suavização (mais detalhe, mais ruído) |
-
-### 9.3 Câmera / Live (layout.js)
-
-| Constante | Valor | Justificativa |
-|---|---|---|
-| `SHARP_MIN` | 80 | Variância do Laplaciano mínima para imagem nítida |
-| `STABLE_FRAMES` | 5 | Frames @~30fps = ~0.17s de estabilidade |
-| `LIVE_WIDTH` | 420 | Balanceia performance vs. precisão na detecção ao vivo |
-
----
-
-## 10. Stack Tecnológica
-
-| Tecnologia | Versão | Uso |
-|---|---|---|
-| **OpenCV.js** | 4.8.0 (WASM) | Processamento de imagem (threshold, warpPerspective, findContours, Laplacian) |
-| JavaScript | ES2022 (modules) | Lógica de aplicação |
-| Canvas API | Nativa | Captura, renderização, anotação |
-| getUserMedia | Nativa | Câmera traseira (`facingMode: 'environment'`) |
-| IndexedDB | Nativa | Persistência de resultados de correção |
-| localStorage | Nativa | Gabarito único configurado |
-| Service Worker | Nativa | PWA offline |
-| CSS3 | Nativa | Layout mobile-first, max-width 600px |
-
----
-
-## 11. Dependências Externas
-
-O protótipo simplificado tem **zero dependências de CDN** em runtime. A única dependência carregada dinamicamente é:
-
-| Biblioteca | URL | Tamanho | Quando |
-|---|---|---|---|
-| OpenCV.js | `docs.opencv.org/4.8.0/opencv.js` | ~8 MB (WASM) | Lazy — carregado 300ms após DOMContentLoaded |
-
-> O OpenCV é carregado em background. O spinner "Carregando motor de visão computacional…" é exibido até o WASM estar pronto (`cv.Mat` disponível ou `cv.onRuntimeInitialized` disparado).
-
----
-
-## 12. Persistência de Dados
-
-### localStorage
-- Chave: `omr-exam`
-- Formato: `{ id, title, n, opt, k }`
-- Conteúdo: gabarito único configurado
-
-### IndexedDB — banco `omr-corretor` (versão 1)
-
-**Object store `results`**
-- Chave: `capturedAt` (ISO 8601)
-- Índice: `examId`
-- Campos: `{ examId, student, score, total, pct, answers[], capturedAt }`
-
-**Cada item em `answers[]`:**
+**`results`** — `keyPath: 'capturedAt'`, índice `examId`
 ```json
 {
-  "q": 1,
-  "marked": "B",
-  "correct": "A",
-  "status": "ok",
-  "right": false,
-  "ratios": [0.03, 0.77, 0.02, 0.04, 0.29]
+  "examId": "AVA01-INT", "student": "", "score": 17, "total": 20, "pct": 85,
+  "capturedAt": "2026-06-06T12:34:56.000Z",
+  "answers": [
+    { "q": 1, "marked": "B", "correct": "A", "status": "ok", "right": false,
+      "ratios": [0.03, 0.77, 0.02, 0.04, 0.29] }
+  ]
 }
 ```
+Exportação disponível em **CSV** e **JSON** na tela de resultado.
 
 ---
 
-## 13. Limitações Conhecidas e Recomendações
+## 14. Stack e Dependências
 
-### Para o usuário
-
-| Situação | Recomendação |
+| Tecnologia | Uso |
 |---|---|
-| Cartão ao longe / marcadores pequenos | Aproximar até o cartão ocupar ≥ 60% do frame |
-| Sombra sobre os marcadores | Usar iluminação uniforme (luz natural difusa ideal) |
-| Foto borrada | O auto-disparo aguarda nitidez; usar "Capturar" só quando estável |
-| Impressão com "Ajustar à página" | Sempre imprimir a 100%, sem escalonamento |
-| Caneta de ponta muito fina | Pode gerar fillRatio < 0.40; usar caneta esferográfica |
+| **OpenCV.js 4.8.0 (WASM ~8 MB)** | threshold, findContours, getPerspectiveTransform, warpPerspective, adaptiveThreshold, Laplacian, moments |
+| JavaScript ES2022 (modules) | lógica da aplicação |
+| Canvas API | captura, render, anotação |
+| getUserMedia | câmera traseira |
+| IndexedDB | provas + resultados |
+| Service Worker + Manifest | PWA offline/instalável |
 
-### Limitações técnicas
-
-| Limitação | Causa | Mitigação futura |
-|---|---|---|
-| Cartão com fundo texturizado pode confundir detector | minArea pequena detecta features do fundo | Aumentar `MARKER_SIZE` para 60–80 u |
-| Marcadores muito pequenos em fotos distantes | `approxPolyDP` não gera quadrilátero para círculos sub-pixel | Aumentar tamanho físico dos marcadores |
-| `FILL_MIN` fixo para qualquer instrumento | Caneta vs. lápis têm densidades diferentes | Calibração por auto-normalização local |
-| Detecção ao vivo limitada a 420px | Performance no WASM em dispositivos antigos | Reduzir para 320px se necessário |
+OpenCV é a **única dependência externa**, carregada *lazy* de `docs.opencv.org/4.8.0/opencv.js` ~300 ms após `DOMContentLoaded`. Cache versionado via `?v=N` nos imports (atual: `v=38`).
 
 ---
 
-## 14. Métricas de Desempenho Típicas
+## 15. Limitações Conhecidas e Recomendações
 
-Medidas em dispositivo Android mid-range (2023):
-
-| Etapa | Tempo típico |
+| Situação | Recomendação / causa |
 |---|---|
-| Carregamento OpenCV.js | 2–5 s (WASM, primeira vez) |
-| Detecção ao vivo por frame | 15–40 ms |
-| Warp de perspectiva (1920×1080) | 20–60 ms |
-| Binarização adaptativa | 10–30 ms |
-| Amostragem 20 questões × 5 alternativas | < 5 ms |
-| Pipeline completo (captura → resultado) | **100–200 ms** |
+| Cartão ao longe | enquadrar até preencher o quadro (especialmente o A4 retrato) |
+| Sombra sobre os marcadores | luz uniforme; a binarização adaptativa ajuda mas não resolve tudo |
+| Impressão escalonada | imprimir sempre a 100% |
+| Caneta de ponta fina | pode gerar `fillRatio < FILL_MIN`; preferir esferográfica |
+| Frame ao vivo a 800 px (A4) | mais CPU; se houver lentidão, reduzir `LIVE_WIDTH` para ~640 |
+| Marcadores de coluna no A4 | não usados no warp; só calibração (com trava de sanidade) |
 
 ---
 
-## 15. Fórmulas de Referência Rápida
+## 16. Fórmulas de Referência Rápida
 
 ```
-# Tamanho físico de qualquer elemento (mm)
-fisico_mm = (valor_canonico / CANON_W) × 210
-
-# Número máximo de questões suportadas
-max_questoes = floor((GRID_BOTTOM - GRID_TOP) / ROW_H) × max_colunas
-             = 24 × floor(CANON_W / colW_minima)
-
-# fillRatio de uma bolha
-ROI_lado = 2 × ceil(BUBBLE_R × ROI_FACTOR) = 2 × ceil(11 × 0.65) = 16 px
-fillRatio = countNonZero(ROI_16x16) / 256
-
-# Diagonal mínima de detecção
-quadDiag_minima = sqrt(imgW² + imgH²) × 0.30
+# físico (A4): mm = (u / 1000) * 210
+# linhas por coluna:        floor((GRID_BOTTOM - GRID_TOP) / ROW_H)
+#   full = 25 ; compacto = 10
+# máx. questões (full):     floor(880 / (opt*24+68)) * 25
+# largura compacto:         2*68 + cols*(64+(opt-1)*38) + (cols-1)*48
+# ROI da bolha:             lado = 2*ceil(BUBBLE_R*0.65) = 16 px ; fillRatio = nonZero/área
+# diagonal mínima de quad:  sqrt(imgW²+imgH²) * 0.25
 ```
 
 ---
 
-*Documento gerado a partir do código-fonte do protótipo em `js/layout.js`, `js/omr.js` e `js/generator.js`.*
+*Documento gerado a partir de `layout.js`, `layout-compact.js`, `omr.js`, `app.js`, `generator.js` e `db.js` (código `?v=38`).*
