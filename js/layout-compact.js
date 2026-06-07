@@ -59,7 +59,7 @@ export const ADAPT_C       = 7;
 export const BLUR_K        = 5;
 export const SHARP_MIN     = 80;
 export const STABLE_FRAMES = 15;     // ~0.5s a 30fps — cartão menor treme mais, exige mais estabilidade
-export const LIVE_WIDTH    = 420;
+export const LIVE_WIDTH    = 420;    // compacto é paisagem e preenche o quadro → 420px já basta
 
 // ─── Helper: dimensões do conteúdo ───────────────────────────────────────────
 

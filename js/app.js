@@ -4,12 +4,12 @@
  * Múltiplos gabaritos persistidos no IndexedDB.
  */
 
-import { saveExam, getExams, deleteExam, saveResult } from './db.js?v=37';
-import { drawCard, randomKey, printCard }              from './generator.js?v=37';
-import { runOMR, analyzeFrame }                        from './omr.js?v=37';
-import { STABLE_FRAMES, LIVE_WIDTH }                   from './layout.js?v=37';
-import * as LayoutFull    from './layout.js?v=37';
-import * as LayoutCompact from './layout-compact.js?v=37';
+import { saveExam, getExams, deleteExam, saveResult } from './db.js?v=38';
+import { drawCard, randomKey, printCard }              from './generator.js?v=38';
+import { runOMR, analyzeFrame }                        from './omr.js?v=38';
+import { STABLE_FRAMES, LIVE_WIDTH }                   from './layout.js?v=38';
+import * as LayoutFull    from './layout.js?v=38';
+import * as LayoutCompact from './layout-compact.js?v=38';
 
 // ─── Toast (notificação não-bloqueante) ────────────────────────────────────────
 function showToast(msg, type = 'info') {
@@ -183,10 +183,15 @@ function setCaptureHint(msg, type = 'info') {
 }
 
 function liveDetectionLoop() {
+  // Resolução do frame ao vivo: específica do layout. A página inteira (A4 retrato)
+  // fica pequena num quadro paisagem → precisa de mais resolução para os marcadores
+  // não sumirem; o compacto preenche o quadro e 420px já basta.
+  const liveWidth = getLayoutMod(state.currentExam).LIVE_WIDTH ?? LIVE_WIDTH;
+
   const tmpCanvas = document.createElement('canvas');
-  tmpCanvas.width  = LIVE_WIDTH;
-  tmpCanvas.height = Math.round(LIVE_WIDTH * (9 / 16));
-  const tmpCtx = tmpCanvas.getContext('2d');
+  tmpCanvas.width  = liveWidth;
+  tmpCanvas.height = Math.round(liveWidth * (9 / 16));
+  const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
 
   // Frames estáveis para auto-disparo: específico do layout da prova atual.
   // O compacto usa um limiar um pouco maior (cartão menor → mais sensível ao tremor).

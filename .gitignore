@@ -1,0 +1,40 @@
+# ─── Dependências / build ───────────────────────────────
+node_modules/
+dist/
+build/
+*.tgz
+
+# ─── Configurações de ferramentas locais (IA / agentes) ──
+.claude/
+.cursor/
+.aider*
+.continue/
+
+# ─── Editores / IDEs ─────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── Sistema operacional ─────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ─── Logs e temporários ──────────────────────────────────
+*.log
+npm-debug.log*
+.tmp/
+tmp/
+*.bak
+
+# ─── Variáveis de ambiente / segredos ────────────────────
+.env
+.env.*
+*.local
+secrets.*
+
+# ─── Cache do service worker / PWA gerado ────────────────
+*.appcache

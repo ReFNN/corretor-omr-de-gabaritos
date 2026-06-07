@@ -40,7 +40,8 @@ export const ADAPT_C       = 7;      // constante C do adaptiveThreshold
 export const BLUR_K        = 5;      // kernel GaussianBlur
 export const SHARP_MIN     = 80;     // variância mínima do Laplaciano (nitidez)
 export const STABLE_FRAMES = 6;      // frames estáveis para auto-disparo (~0.2s a 30fps)
-export const LIVE_WIDTH    = 420;    // largura do frame ao vivo para detecção
+export const LIVE_WIDTH    = 800;    // frame ao vivo maior: cartão A4 retrato fica pequeno no quadro
+                                     // paisagem → marcadores ~13px (a 420px ficavam ~7px, indetectáveis)
 
 /**
  * Retorna as posições (centros) dos 4 marcadores no espaço canônico.

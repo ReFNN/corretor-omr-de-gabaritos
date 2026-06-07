@@ -16,7 +16,7 @@ import {
   getMarkerPositions    as fullMarkers,
   getBubbleCoords       as fullBubbles,
   getColMarkerPositions as fullColMarkers,
-} from './layout.js?v=37';
+} from './layout.js?v=38';
 
 import {
   CANON_H    as COMP_H,
@@ -25,7 +25,7 @@ import {
   getCanonW            as compGetCanonW,
   getMarkerPositions   as compMarkers,
   getBubbleCoords      as compBubbles,
-} from './layout-compact.js?v=37';
+} from './layout-compact.js?v=38';
 
 // ─── Utilitário comum ──────────────────────────────────────────────────────────
 
