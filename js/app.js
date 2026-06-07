@@ -4,12 +4,12 @@
  * Múltiplos gabaritos persistidos no IndexedDB.
  */
 
-import { saveExam, getExams, deleteExam, saveResult } from './db.js?v=21';
-import { drawCard, randomKey, printCard }              from './generator.js?v=21';
-import { runOMR, analyzeFrame }                        from './omr.js?v=21';
-import { STABLE_FRAMES, LIVE_WIDTH }                   from './layout.js?v=21';
-import * as LayoutFull    from './layout.js?v=21';
-import * as LayoutCompact from './layout-compact.js?v=21';
+import { saveExam, getExams, deleteExam, saveResult } from './db.js?v=37';
+import { drawCard, randomKey, printCard }              from './generator.js?v=37';
+import { runOMR, analyzeFrame }                        from './omr.js?v=37';
+import { STABLE_FRAMES, LIVE_WIDTH }                   from './layout.js?v=37';
+import * as LayoutFull    from './layout.js?v=37';
+import * as LayoutCompact from './layout-compact.js?v=37';
 
 // ─── Toast (notificação não-bloqueante) ────────────────────────────────────────
 function showToast(msg, type = 'info') {
@@ -188,12 +188,16 @@ function liveDetectionLoop() {
   tmpCanvas.height = Math.round(LIVE_WIDTH * (9 / 16));
   const tmpCtx = tmpCanvas.getContext('2d');
 
+  // Frames estáveis para auto-disparo: específico do layout da prova atual.
+  // O compacto usa um limiar um pouco maior (cartão menor → mais sensível ao tremor).
+  const stableFrames = getLayoutMod(state.currentExam).STABLE_FRAMES ?? STABLE_FRAMES;
+
   // Verificação de posição: marcadores devem estar no mesmo lugar entre frames.
   // Evita falsos positivos em baixa luz (ruído gera "marcadores" em posições diferentes a cada frame).
   let lastMarkers = null;
-  let missCount   = 0;          // frames consecutivos sem detecção válida
-  const MAX_DRIFT = 25;         // px no frame reduzido (420px) — alta tolerância ao tremor
-  const MAX_MISS  = 4;          // frames sem detecção tolerados antes de resetar contador
+  let missCount   = 0;          // frames "transientes" consecutivos (pisca de detecção OU tremor)
+  const MAX_DRIFT = 45;         // px no frame reduzido (420px) — tolerância ao tremor das mãos
+  const MAX_MISS  = 12;         // transientes tolerados antes de resetar (~0.4s de tremor/pisca)
 
   function markersPositionOk(curr, prev) {
     if (!prev) return true;   // primeira detecção após perda: aceitar sem comparar posição
@@ -211,48 +215,55 @@ function liveDetectionLoop() {
       tmpCtx.drawImage(captureVideo, 0, 0, tmpCanvas.width, tmpCanvas.height);
       const frameData = tmpCtx.getImageData(0, 0, tmpCanvas.width, tmpCanvas.height);
       const { markersFound, quadOk, sharpOk, markers } = analyzeFrame(frameData);
+      const validNow = markersFound && quadOk && markers;
 
+      // Overlay: desenha os marcadores atuais; durante piscas curtas, mantém os
+      // últimos conhecidos para a caixa verde não piscar.
       overlayCtx.clearRect(0, 0, captureOverlay.width, captureOverlay.height);
-      if (markersFound && markers) drawMarkerOverlay(markers, tmpCanvas.width, tmpCanvas.height);
+      if (validNow) {
+        drawMarkerOverlay(markers, tmpCanvas.width, tmpCanvas.height);
+      } else if (lastMarkers && missCount < MAX_MISS) {
+        drawMarkerOverlay(lastMarkers, tmpCanvas.width, tmpCanvas.height);
+      }
 
-      if (!markersFound || !quadOk) {
-        // Marcadores perdidos ou fora de quadro: tolerância de MAX_MISS frames antes de resetar.
-        // Detecção é inerentemente intermitente (threshold Otsu varia por frame);
-        // resetar imediatamente a cada frame perdido impedia o contador de acumular.
-        missCount++;
-        if (missCount > MAX_MISS) {
-          state.stableCount = 0;
-          lastMarkers = null;
-        }
-        if (!markersFound) {
-          setCaptureHint('🔍 Procurando marcadores nos cantos...', 'info');
-        } else {
-          setCaptureHint('↔ Afaste-se para ver os 4 cantos do cartão', 'warn');
-        }
-      } else if (!markersPositionOk(markers, lastMarkers)) {
-        // Câmera em movimento brusco → reseta
-        missCount = 0;
-        state.stableCount = 0;
-        lastMarkers = markers;
-        setCaptureHint('📷 Mantenha o cartão parado...', 'warn');
-      } else {
-        // Posição estável → acumula contador independente da nitidez
+      if (validNow && markersPositionOk(markers, lastMarkers)) {
+        // Posição estável (dentro da tolerância de tremor) → acumula o contador,
+        // independente da nitidez (o foco oscila, mas não deve perder o progresso).
         missCount = 0;
         lastMarkers = markers;
         state.stableCount++;
-        const remaining = STABLE_FRAMES - state.stableCount;
+        const remaining = stableFrames - state.stableCount;
 
         if (!sharpOk) {
-          // Borrado: mostra aviso mas não reseta — aguarda o foco acertar
           setCaptureHint(`🔀 Aguardando foco... (${Math.max(0, remaining)})`, 'warn');
         } else if (remaining > 0) {
           setCaptureHint(`✓ Segure firme... (${remaining})`, 'ok');
         } else {
-          // frames estáveis E nítido → dispara
           setCaptureHint('📸 Capturando...', 'ok');
           state.stableCount = 0;
           triggerCapture();
           return;
+        }
+      } else {
+        // TRANSIENTE: pisca de detecção (threshold varia) OU pulo de tremor além da
+        // tolerância. Não reseta de imediato — segura o progresso por até MAX_MISS
+        // frames (mantendo lastMarkers como referência estável). Só reseta se o
+        // movimento/perda for SUSTENTADO (reposicionamento real do cartão).
+        missCount++;
+        if (lastMarkers === null) {
+          setCaptureHint('🔍 Procurando marcadores nos cantos...', 'info');
+        } else if (missCount > MAX_MISS) {
+          state.stableCount = 0;
+          lastMarkers = null;
+          if (!markersFound)   setCaptureHint('🔍 Procurando marcadores nos cantos...', 'info');
+          else if (!quadOk)    setCaptureHint('↔ Afaste-se para ver os 4 cantos do cartão', 'warn');
+          else                 setCaptureHint('📷 Mantenha o cartão parado...', 'warn');
+        } else if (state.stableCount > 0) {
+          // segura o countdown durante o transiente
+          const remaining = stableFrames - state.stableCount;
+          setCaptureHint(`✓ Segure firme... (${Math.max(0, remaining)})`, 'ok');
+        } else {
+          setCaptureHint('🔍 Procurando marcadores nos cantos...', 'info');
         }
       }
     }

@@ -39,7 +39,14 @@ const LABEL_W  = 36;   // largura do número da questão
 const OPT_GAP  = 38;   // distância centro-a-centro entre bolhas (horizontal)
 const COL_GAP  = 48;   // espaço extra entre duas colunas adjacentes
 
+// === Estratégia de warp ===
+// O compacto tem borda preta nítida → usá-la dá cantos precisos e warp estável.
+export const USE_BORDER_WARP = true;
+
 // === Marcadores de coluna ===
+// O layout compacto NÃO imprime marcadores de coluna (confundiam o detector e
+// não cabem bem no cartão pequeno). A calibração por coluna fica desligada.
+export const HAS_COL_MARKERS = false;
 export const COL_MARKER_SIZE = 12;
 export const COL_MARKER_GAP  = 4;
 
@@ -51,7 +58,7 @@ export const ADAPT_BLOCK   = 25;
 export const ADAPT_C       = 7;
 export const BLUR_K        = 5;
 export const SHARP_MIN     = 80;
-export const STABLE_FRAMES = 5;
+export const STABLE_FRAMES = 15;     // ~0.5s a 30fps — cartão menor treme mais, exige mais estabilidade
 export const LIVE_WIDTH    = 420;
 
 // ─── Helper: dimensões do conteúdo ───────────────────────────────────────────

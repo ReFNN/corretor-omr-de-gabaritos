@@ -23,7 +23,11 @@ export const ROW_H = 40;
 export const BUBBLE_R = 11;
 export const LABEL_W = 44;
 
+// === Estratégia de warp ===
+export const USE_BORDER_WARP = false; // página inteira usa os 4 marcadores (a borda é cinza-clara e fina)
+
 // === Marcadores de coluna ===
+export const HAS_COL_MARKERS = true; // este layout imprime marcadores de coluna (calibração de linha por coluna)
 export const COL_MARKER_SIZE = 14;   // lado do marcador de coluna (u canônicos ≈ 2.94 mm)
 export const COL_MARKER_GAP  = 6;    // espaço entre o marcador e a borda da grade
 

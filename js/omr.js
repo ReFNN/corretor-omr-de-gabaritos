@@ -13,7 +13,7 @@
 import {
   BLUR_K, ADAPT_BLOCK, ADAPT_C,
   FILL_MIN, MARGIN_MIN, ROI_FACTOR,
-} from './layout.js?v=21';
+} from './layout.js?v=37';
 
 // ─── Utilitários internos ─────────────────────────────────────────────────────
 
@@ -38,7 +38,7 @@ export function sharpness(grayMat) {
  * Detecta os 4 marcadores fiduciais em `grayMat`.
  * Funciona para qualquer layout (não depende de geometria específica).
  */
-export function detectMarkers(grayMat) {
+export function detectMarkers(grayMat, debug = false) {
   const blurred  = new cv.Mat();
   const binary   = new cv.Mat();
   const contours = new cv.MatVector();
@@ -67,13 +67,26 @@ export function detectMarkers(grayMat) {
     if (approx.rows === 4) {
       const rect   = cv.boundingRect(approx);
       const aspect = rect.width / rect.height;
+      // Solidez = área preenchida / área do bounding box. Um marcador é um quadrado
+      // SÓLIDO → ~1.0. Bolhas vazias (anéis) e rabiscos têm solidez baixa → filtrados.
+      // É o que distingue marcador de bolha quando têm tamanhos parecidos (compacto).
+      const solidity = area / (rect.width * rect.height);
 
-      if (aspect > 0.6 && aspect < 1.6) {
-        const M        = cv.moments(cnt);
-        const cx       = M.m00 !== 0 ? M.m10 / M.m00 : rect.x + rect.width / 2;
-        const cy       = M.m00 !== 0 ? M.m01 / M.m00 : rect.y + rect.height / 2;
-        const h        = hier.intPtr(0, i);
-        const hasChild = h[2] >= 0;
+      if (aspect > 0.6 && aspect < 1.6 && solidity > 0.80) {
+        const M  = cv.moments(cnt);
+        const cx = M.m00 !== 0 ? M.m10 / M.m00 : rect.x + rect.width / 2;
+        const cy = M.m00 !== 0 ? M.m01 / M.m00 : rect.y + rect.height / 2;
+        const h  = hier.intPtr(0, i);
+
+        // hasChild só vale como ÂNCORA se o furo for pequeno e centrado (~16% da área).
+        // Bolha vazia é um ANEL: seu "furo" interno é grande (>35%) → NÃO é âncora.
+        let hasChild = false;
+        if (h[2] >= 0) {
+          const child     = contours.get(h[2]);
+          const childArea = cv.contourArea(child);
+          child.delete();
+          hasChild = childArea > area * 0.02 && childArea < area * 0.35;
+        }
         candidates.push({ cx, cy, area, hasChild });
       }
     }
@@ -84,42 +97,65 @@ export function detectMarkers(grayMat) {
   releaseMats(blurred, binary, hier);
   contours.delete();
 
+  if (debug) {
+    const nAnchor = candidates.filter(c => c.hasChild).length;
+    console.log(`[OMR] detectMarkers: ${candidates.length} candidatos sólidos (${nAnchor} com furo).`);
+  }
+
   return identifyMarkers(candidates, grayMat.cols, grayMat.rows);
 }
 
-function checkGroupAsMarkers(group, imgW, imgH) {
+/**
+ * Orienta 4 candidatos por posição extrema, assumindo o cartão aproximadamente
+ * na vertical: TL=min(x+y) · BR=max(x+y) · TR=max(x−y) · BL=min(x−y).
+ * Retorna { tl, tr, bl, br } ou null se os extremos coincidirem (quad degenerado).
+ */
+function orientByExtremes(group) {
+  let tl, tr, bl, br;
+  let minS = Infinity, maxS = -Infinity, minD = Infinity, maxD = -Infinity;
+  for (const c of group) {
+    const s = c.cx + c.cy, d = c.cx - c.cy;
+    if (s < minS) { minS = s; tl = c; }
+    if (s > maxS) { maxS = s; br = c; }
+    if (d > maxD) { maxD = d; tr = c; }
+    if (d < minD) { minD = d; bl = c; }
+  }
+  if (new Set([tl, tr, bl, br]).size !== 4) return null;
+  return { tl, tr, bl, br };
+}
+
+/**
+ * Valida um grupo de 4 candidatos como os marcadores de canto (apenas GEOMETRIA).
+ *
+ * A orientação aqui é só provisória, por extremos — a orientação FINAL (qual canto
+ * é o BR) é decidida depois do warp, pelo furo da âncora (detectAnchorCornerInWarp),
+ * que é robusto a rotação. Por isso a seleção NÃO depende da âncora: assim âncoras
+ * falsas (bolhas com furo) não atrapalham a escolha dos 4 cantos.
+ *
+ * Retorna { tl, tr, bl, br } (coords) ou null.
+ */
+function validateGroup(group, imgW, imgH) {
+  if (group.length !== 4) return null;
+
   const areas = group.map(c => c.area);
+  // Os 4 marcadores de canto têm tamanho semelhante. Se a razão for grande,
+  // o grupo misturou um marcador de canto com algo menor (coluna/ruído) → rejeita.
   if (Math.max(...areas) / Math.min(...areas) > 4) return null;
 
-  const anchors = group.filter(c => c.hasChild);
-  // Exige exatamente 1 âncora (marcador BR com furo branco).
-  // 0 âncoras → grupo de elementos do ambiente ou marcadores de coluna → rejeitar.
-  // 2+ âncoras → bolhas vazias ou padrões QR → rejeitar.
-  if (anchors.length !== 1) return null;
+  // Orientação provisória por extremos.
+  const o = orientByExtremes(group);
+  if (!o) return null;
+  const { tl, tr, bl, br } = o;
 
-  const mcx = group.reduce((s, c) => s + c.cx, 0) / 4;
-  const mcy = group.reduce((s, c) => s + c.cy, 0) / 4;
-
-  const tls = group.filter(c => c.cx <= mcx && c.cy <= mcy);
-  const trs = group.filter(c => c.cx >  mcx && c.cy <= mcy);
-  const bls = group.filter(c => c.cx <= mcx && c.cy >  mcy);
-  const brs = group.filter(c => c.cx >  mcx && c.cy >  mcy);
-
-  if (tls.length !== 1 || trs.length !== 1 || bls.length !== 1 || brs.length !== 1) return null;
-
-  let tl = tls[0], tr = trs[0], bl = bls[0], br = brs[0];
-
-  if (anchors.length === 1) {
-    const anchor = anchors[0];
-    const rots = [
-      { tl, tr, bl, br },
-      { tl: bl, tr: tl, bl: br, br: tr },
-      { tl: br, tr: bl, bl: tr, br: tl },
-      { tl: tr, tr: br, bl: tl, br: bl },
-    ];
-    const correct = rots.find(r => r.br === anchor);
-    if (correct) { tl = correct.tl; tr = correct.tr; bl = correct.bl; br = correct.br; }
-  }
+  // Rejeita grupos COLINEARES/degenerados: o bounding box dos 4 pontos precisa ter
+  // os dois lados comparáveis. (4 pontos numa linha — ex.: bolhas de uma fileira —
+  // enganavam o check de proporção baseado em papéis e produziam warp espremido.)
+  const xs = [tl.cx, tr.cx, bl.cx, br.cx];
+  const ys = [tl.cy, tr.cy, bl.cy, br.cy];
+  const bbW = Math.max(...xs) - Math.min(...xs);
+  const bbH = Math.max(...ys) - Math.min(...ys);
+  if (bbW <= 0 || bbH <= 0) return null;
+  if (Math.min(bbW, bbH) / Math.max(bbW, bbH) < 0.30) return null;
 
   const topW   = Math.hypot(tr.cx - tl.cx, tr.cy - tl.cy);
   const botW   = Math.hypot(br.cx - bl.cx, br.cy - bl.cy);
@@ -136,7 +172,7 @@ function checkGroupAsMarkers(group, imgW, imgH) {
 
   const imgDiag  = Math.hypot(imgW, imgH);
   const quadDiag = Math.hypot(br.cx - tl.cx, br.cy - tl.cy);
-  if (quadDiag < imgDiag * 0.25) return null;  // reduzido de 0.30 → cartão compacto cabe em menos espaço
+  if (quadDiag < imgDiag * 0.25) return null;  // o quad deve cobrir boa parte da imagem
 
   return {
     tl: [tl.cx, tl.cy],
@@ -146,32 +182,86 @@ function checkGroupAsMarkers(group, imgW, imgH) {
   };
 }
 
-function identifyMarkers(candidates, imgW, imgH) {
-  if (candidates.length < 4) return null;
+/**
+ * Seleciona os 4 candidatos nos EXTREMOS da nuvem de pontos:
+ *   TL = min(x+y) · BR = max(x+y) · TR = max(x−y) · BL = min(x−y)
+ *
+ * Os marcadores de canto são sempre os pontos extremos do cartão; os marcadores
+ * de coluna, as bolhas e o ruído interno ficam "para dentro" e são ignorados
+ * automaticamente. É o que permite usar marcadores de coluna sem confundir o warp.
+ */
+function selectByExtremes(candidates) {
+  let tl, tr, bl, br;
+  let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
 
-  candidates.sort((a, b) => a.area - b.area);
-  const limit = Math.min(candidates.length, 15);
+  for (const c of candidates) {
+    const sum  = c.cx + c.cy;
+    const diff = c.cx - c.cy;
+    if (sum  < minSum)  { minSum  = sum;  tl = c; }
+    if (sum  > maxSum)  { maxSum  = sum;  br = c; }
+    if (diff > maxDiff) { maxDiff = diff; tr = c; }
+    if (diff < minDiff) { minDiff = diff; bl = c; }
+  }
 
+  const group = [tl, tr, bl, br];
+  if (new Set(group).size !== 4) return null;   // candidatos extremos coincidentes
+  return group;
+}
+
+/**
+ * Força-bruta: testa todas as combinações de 4 dentro de `list` (até 16 itens).
+ * Retorna o primeiro grupo válido ou null.
+ */
+function bruteForceGroups(list, imgW, imgH) {
+  const limit = Math.min(list.length, 16);   // C(16,4)=1820 combinações — barato
   for (let i = 0; i < limit - 3; i++) {
-    const areaI = candidates[i].area;
-    const maxAllowed = areaI * 4;
     for (let j = i + 1; j < limit - 2; j++) {
-      if (candidates[j].area > maxAllowed) break;
       for (let k = j + 1; k < limit - 1; k++) {
-        if (candidates[k].area > maxAllowed) break;
         for (let l = k + 1; l < limit; l++) {
-          if (candidates[l].area > maxAllowed) break;
-          const result = checkGroupAsMarkers(
-            [candidates[i], candidates[j], candidates[k], candidates[l]],
-            imgW, imgH,
-          );
+          const result = validateGroup([list[i], list[j], list[k], list[l]], imgW, imgH);
           if (result) return result;
         }
       }
     }
   }
-
   return null;
+}
+
+/**
+ * Identifica os 4 marcadores de canto.
+ *
+ *   1) PRIMÁRIO — EXTREMOS sobre todos os candidatos: como o cartão ocupa quase
+ *      todo o quadro, os 4 marcadores de canto são os pontos extremos da nuvem.
+ *      É a forma mais direta e estável de pegar os cantos, e não depende da âncora
+ *      (que pode ter falsos positivos entre bolhas).
+ *
+ *   2) FALLBACK — ancorado na âncora: filtra candidatos do tamanho da âncora e
+ *      busca entre eles (útil quando o cartão não preenche o quadro).
+ *
+ *   3) FALLBACK — força-bruta sobre os maiores quadrados.
+ */
+function identifyMarkers(candidates, imgW, imgH) {
+  if (candidates.length < 4) return null;
+
+  // 1) Extremos — primário (cartão preenche o quadro → cantos são os extremos).
+  const extreme = selectByExtremes(candidates);
+  if (extreme) {
+    const result = validateGroup(extreme, imgW, imgH);
+    if (result) return result;
+  }
+
+  // 2) Ancorado na âncora.
+  const anchors = candidates.filter(c => c.hasChild);
+  for (const anchor of anchors) {
+    const lo = anchor.area / 4, hi = anchor.area * 4;
+    const similar = candidates.filter(c => c.area >= lo && c.area <= hi);
+    const found = bruteForceGroups(similar, imgW, imgH);
+    if (found) return found;
+  }
+
+  // 3) Força-bruta sobre os maiores quadrados.
+  const sorted = [...candidates].sort((a, b) => b.area - a.area);
+  return bruteForceGroups(sorted, imgW, imgH);
 }
 
 // ─── Homografia e warp ────────────────────────────────────────────────────────
@@ -199,6 +289,174 @@ export function warpToCanonical(srcMat, markers, layoutMod, canonW, canonH) {
 
   releaseMats(srcPts, dstPts, M);
   return warped;
+}
+
+/**
+ * Detecta a BORDA retangular do cartão (o quadrilátero impresso ao redor das
+ * questões) e devolve seus 4 cantos, atribuídos aos papéis tl/tr/bl/br pela
+ * proximidade aos marcadores já validados.
+ *
+ * A borda dá cantos muito mais precisos e distantes que os centros dos 4
+ * marcadores pequenos → warp muito mais estável (menos inclinação).
+ *
+ * Ancorado nos marcadores: aceita apenas o quad cujos 4 cantos ABRAÇAM os
+ * marcadores (cada canto a ≤20% da diagonal dos marcadores do seu marcador).
+ * Isso rejeita a borda da página/mesa e quads espúrios (cantos distantes), e
+ * faz cada canto herdar o papel (tl/tr/bl/br) do marcador correspondente.
+ * Se nenhum quad casar com folga apertada, retorna null → warp pelos marcadores.
+ *
+ * @returns {{tl,tr,bl,br}|null}  cantos em coordenadas de imagem, ou null.
+ */
+function detectCardBorder(grayMat, markers) {
+  const blurred  = new cv.Mat();
+  const binary   = new cv.Mat();
+  const contours = new cv.MatVector();
+  const hier     = new cv.Mat();
+
+  cv.GaussianBlur(grayMat, blurred, new cv.Size(BLUR_K, BLUR_K), 0);
+  cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+  cv.findContours(binary, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+  const imgArea = grayMat.cols * grayMat.rows;
+  const roles   = ['tl', 'tr', 'bl', 'br'];
+  const mx = roles.map(r => markers[r][0]);
+  const my = roles.map(r => markers[r][1]);
+  const markerDiag = Math.hypot(Math.max(...mx) - Math.min(...mx), Math.max(...my) - Math.min(...my));
+
+  // Cada canto da borda deve "abraçar" seu marcador: ficar bem próximo dele.
+  // A borda do cartão fica a poucos % de distância dos marcadores; a página/mesa
+  // (ou um quad espúrio) tem cantos muito mais distantes → rejeitado.
+  const maxCornerDist = markerDiag * 0.20;
+
+  let bestAssign = null, bestScore = Infinity;
+
+  for (let i = 0; i < contours.size(); i++) {
+    const cnt  = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < imgArea * 0.03) { cnt.delete(); continue; }
+
+    const peri   = cv.arcLength(cnt, true);
+    const approx = new cv.Mat();
+    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+    if (approx.rows === 4 && cv.isContourConvex(approx)) {
+      const pts = [];
+      for (let p = 0; p < 4; p++) {
+        const ptr = approx.intPtr(p, 0);
+        pts.push({ x: ptr[0], y: ptr[1] });
+      }
+
+      // Casa cada papel de marcador com o canto mais próximo (1-para-1).
+      const used = new Set();
+      const assign = {};
+      let score = 0, ok = true;
+      for (let r = 0; r < 4; r++) {
+        let bi = -1, bd = Infinity;
+        for (let k = 0; k < 4; k++) {
+          if (used.has(k)) continue;
+          const d = Math.hypot(pts[k].x - mx[r], pts[k].y - my[r]);
+          if (d < bd) { bd = d; bi = k; }
+        }
+        if (bd > maxCornerDist) { ok = false; break; }
+        used.add(bi);
+        assign[roles[r]] = pts[bi];
+        score += bd;
+      }
+
+      if (ok && score < bestScore) { bestScore = score; bestAssign = assign; }
+    }
+    approx.delete();
+    cnt.delete();
+  }
+
+  releaseMats(blurred, binary, hier);
+  contours.delete();
+  if (!bestAssign) return null;
+
+  return {
+    tl: [bestAssign.tl.x, bestAssign.tl.y],
+    tr: [bestAssign.tr.x, bestAssign.tr.y],
+    bl: [bestAssign.bl.x, bestAssign.bl.y],
+    br: [bestAssign.br.x, bestAssign.br.y],
+  };
+}
+
+/**
+ * Warp usando os 4 cantos da BORDA do cartão → retângulo canônico completo
+ * (0,0)–(canonW,canonH). A borda impressa fica rente à borda do espaço canônico,
+ * então as bolhas (em coordenadas canônicas) caem exatamente no lugar.
+ */
+export function warpByBorder(srcMat, border, canonW, canonH) {
+  const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    ...border.tl, ...border.tr, ...border.bl, ...border.br,
+  ]);
+  const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    0, 0,  canonW, 0,  0, canonH,  canonW, canonH,
+  ]);
+
+  const M      = cv.getPerspectiveTransform(srcPts, dstPts);
+  const warped = new cv.Mat();
+  cv.warpPerspective(srcMat, warped, M, new cv.Size(canonW, canonH));
+
+  releaseMats(srcPts, dstPts, M);
+  return warped;
+}
+
+/**
+ * Determina a orientação correta DEPOIS do warp, pelo furo da âncora.
+ *
+ * No espaço canônico o marcador-âncora tem ~32px com um furo branco de ~13px —
+ * grande e nítido (ao contrário do frame original, onde o furo some). Amostra o
+ * CENTRO dos 4 cantos: a âncora é o de centro mais claro (furo). Devolve o canto
+ * onde a âncora caiu ('tl'|'tr'|'bl'|'br'), ou null se ambíguo.
+ */
+function detectAnchorCornerInWarp(grayCanon, layoutMod, canonW, canonH) {
+  const pos = layoutMod.getMarkerPositions(canonW, canonH);
+  const r   = Math.max(3, Math.round(canonW * 0.006));
+
+  const sampleCenter = ([cx, cy]) => {
+    const x = Math.max(0, Math.round(cx - r));
+    const y = Math.max(0, Math.round(cy - r));
+    const w = Math.min(grayCanon.cols - x, 2 * r);
+    const h = Math.min(grayCanon.rows - y, 2 * r);
+    if (w <= 0 || h <= 0) return 0;
+    const roi = grayCanon.roi(new cv.Rect(x, y, w, h));
+    const m   = cv.mean(roi)[0];
+    roi.delete();
+    return m;
+  };
+
+  const vals = {
+    tl: sampleCenter(pos.tl), tr: sampleCenter(pos.tr),
+    bl: sampleCenter(pos.bl), br: sampleCenter(pos.br),
+  };
+  const keys = ['tl', 'tr', 'bl', 'br'].sort((a, b) => vals[b] - vals[a]);
+  // O furo (branco) deve ser claramente mais brilhante que o 2º canto mais claro.
+  if (vals[keys[0]] - vals[keys[1]] < 40) return null;
+  return keys[0];
+}
+
+/**
+ * Reatribui os papéis tl/tr/bl/br a 4 pontos sabendo qual é a âncora (= BR),
+ * pelo método invariante a rotação (TL = mais distante; TR/BL pela diagonal).
+ * @param {Array<[number,number]>} pts
+ * @param {[number,number]}        anchor  um dos pontos de pts
+ */
+function orientByAnchorPoint(pts, anchor) {
+  const br = anchor;
+  const others = pts.filter(p => p !== anchor);
+  let tl = others[0], maxD = -1;
+  for (const p of others) {
+    const d = Math.hypot(p[0] - br[0], p[1] - br[1]);
+    if (d > maxD) { maxD = d; tl = p; }
+  }
+  const rest = others.filter(p => p !== tl);
+  const dx = br[0] - tl[0], dy = br[1] - tl[1];
+  const cross = p => dx * (p[1] - tl[1]) - dy * (p[0] - tl[0]);
+  let tr, bl;
+  if (cross(rest[0]) < 0) { tr = rest[0]; bl = rest[1]; }
+  else                    { tr = rest[1]; bl = rest[0]; }
+  return { tl, tr, bl, br };
 }
 
 // ─── Binarização e amostragem ─────────────────────────────────────────────────
@@ -304,6 +562,14 @@ export function refineWithColMarkers(binaryCanon, questions, n, opt, layoutMod) 
     const calibFirstY = topFound[1] + CMS / 2 + CMG + ROW_H_L / 2;
     const calibLastY  = botFound[1] - CMS / 2 - CMG - ROW_H_L / 2;
     const spacing     = qInCol > 1 ? (calibLastY - calibFirstY) / (qInCol - 1) : ROW_H_L;
+
+    // Trava de sanidade: se o espaçamento calibrado destoar muito do nominal
+    // (±30%), é quase certo um falso positivo (texto, borda, bolha) — ignora a
+    // calibração desta coluna e mantém as coordenadas canônicas.
+    if (spacing < ROW_H_L * 0.7 || spacing > ROW_H_L * 1.3) {
+      console.warn(`[OMR] Col${col}: calibração descartada (spacing=${spacing.toFixed(1)}, nominal=${ROW_H_L}).`);
+      continue;
+    }
 
     const qStart = col * perCol;
     for (let r = 0; r < qInCol; r++) {
@@ -455,16 +721,49 @@ export function runOMR(source, exam, student = '', layoutMod) {
     cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
 
     // 3. Detectar marcadores
-    const markers = detectMarkers(grayMat);
+    const markers = detectMarkers(grayMat, true);
     if (!markers) {
       releaseMats(srcMat, grayMat);
       return { result: null, canonCanvas: null, error: 'Marcadores não encontrados. Enquadre melhor o cartão.' };
     }
+    console.log('[OMR] Marcadores (img):',
+      'tl', markers.tl.map(Math.round), 'tr', markers.tr.map(Math.round),
+      'bl', markers.bl.map(Math.round), 'br', markers.br.map(Math.round));
 
     // 4. Warp para espaço canônico do layout (largura adaptativa se disponível)
     const canonW = layoutMod.getCanonW ? layoutMod.getCanonW(exam.n, exam.opt) : layoutMod.CANON_W;
     const canonH = layoutMod.CANON_H;
-    warpedColor = warpToCanonical(srcMat, markers, layoutMod, canonW, canonH);
+
+    // Aplica o warp com uma dada orientação de marcadores. Prefere a BORDA do
+    // cartão (cantos precisos → warp estável) nos layouts com borda nítida (compacto);
+    // a página inteira usa sempre os centros dos 4 marcadores.
+    const doWarp = (mk) => {
+      if (layoutMod.USE_BORDER_WARP) {
+        const b = detectCardBorder(grayMat, mk);
+        if (b) { console.log('[OMR] Warp pela BORDA do cartão.'); return warpByBorder(srcMat, b, canonW, canonH); }
+        console.warn('[OMR] Borda NÃO casou com os marcadores → warp pelos marcadores.');
+      }
+      return warpToCanonical(srcMat, mk, layoutMod, canonW, canonH);
+    };
+
+    // Warp provisório (orientação inicial dos marcadores).
+    warpedColor = doWarp(markers);
+
+    // Confirma a orientação pelo furo da âncora NO ESPAÇO RETIFICADO (onde o furo
+    // é grande e nítido). Se a âncora não caiu no canto BR, corrige e refaz o warp.
+    // É isso que elimina o cartão sair de cabeça pra baixo / espelhado.
+    let gOrient = new cv.Mat();
+    cv.cvtColor(warpedColor, gOrient, cv.COLOR_RGBA2GRAY);
+    const holeCorner = detectAnchorCornerInWarp(gOrient, layoutMod, canonW, canonH);
+    gOrient.delete();
+
+    if (holeCorner && holeCorner !== 'br') {
+      console.log(`[OMR] Âncora detectada no canto ${holeCorner} → corrigindo orientação e refazendo o warp.`);
+      const pts   = [markers.tl, markers.tr, markers.bl, markers.br];
+      const fixed = orientByAnchorPoint(pts, markers[holeCorner]);
+      releaseMats(warpedColor);
+      warpedColor = doWarp(fixed);
+    }
 
     // 5. Cinza canônico
     grayCanon = new cv.Mat();
@@ -476,8 +775,12 @@ export function runOMR(source, exam, student = '', layoutMod) {
     // 7. Coordenadas das bolhas
     const questions = layoutMod.getBubbleCoords(exam.n, exam.opt);
 
-    // 7b. Calibração local com marcadores de coluna
-    refineWithColMarkers(binary, questions, exam.n, exam.opt, layoutMod);
+    // 7b. Calibração local com marcadores de coluna (só se o layout os imprime).
+    // O compacto não desenha marcadores de coluna → calibrar contra eles
+    // produziria falsos positivos e desalinharia as bolhas.
+    if (layoutMod.HAS_COL_MARKERS) {
+      refineWithColMarkers(binary, questions, exam.n, exam.opt, layoutMod);
+    }
 
     // 8. Amostrar bolhas
     const samples = sampleBubbles(binary, questions);

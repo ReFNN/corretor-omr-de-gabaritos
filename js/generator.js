@@ -12,9 +12,11 @@ import {
   MARKER_INSET   as FULL_MI,
   HEADER_H,
   BUBBLE_R       as FULL_BR,
+  COL_MARKER_SIZE as FULL_CMS,
   getMarkerPositions    as fullMarkers,
   getBubbleCoords       as fullBubbles,
-} from './layout.js?v=21';
+  getColMarkerPositions as fullColMarkers,
+} from './layout.js?v=37';
 
 import {
   CANON_H    as COMP_H,
@@ -23,7 +25,7 @@ import {
   getCanonW            as compGetCanonW,
   getMarkerPositions   as compMarkers,
   getBubbleCoords      as compBubbles,
-} from './layout-compact.js?v=21';
+} from './layout-compact.js?v=37';
 
 // ─── Utilitário comum ──────────────────────────────────────────────────────────
 
@@ -87,11 +89,17 @@ function drawCardFull(canvas, exam) {
   ctx.fillStyle = '#555';
   ctx.fillText('Preencha completamente a bolha com caneta. Não rasure.', hdrX, hdrY + 110 * sy);
 
-  // Marcadores de coluna REMOVIDOS permanentemente:
-  // os quadradinhos pretos acima/abaixo de cada coluna são detectados como
-  // candidatos a marcador fiducial, formando grupos falsos de 4 elementos
-  // e causando warp completamente errado. Testado em v20 — confirmado o problema.
-  // O warp global pelos 4 marcadores de canto é suficiente para leitura correta.
+  // Marcadores de coluna: quadradinhos pretos acima/abaixo de cada coluna.
+  // O detector (omr.js) agora seleciona os 4 marcadores de canto por posição
+  // extrema, então estes marcadores interiores não confundem mais o warp.
+  // Servem para calibrar o espaçamento de linhas por coluna (refineWithColMarkers).
+  const colData = fullColMarkers(n, opt);
+  ctx.fillStyle = '#000';
+  colData.forEach(({ top, bot }) => {
+    const half = FULL_CMS / 2;
+    ctx.fillRect((top[0] - half) * sx, (top[1] - half) * sy, FULL_CMS * sx, FULL_CMS * sy);
+    ctx.fillRect((bot[0] - half) * sx, (bot[1] - half) * sy, FULL_CMS * sx, FULL_CMS * sy);
+  });
 
   // Cabeçalho de alternativas por coluna
   const questions = fullBubbles(n, opt);
